@@ -19,6 +19,9 @@
   },
   "contact": {
     "email": "",
+    "phone": "",
+    "address": "",
+    "hours": "",
     "whatsapp": "",
     "whatsappUrl": "",
     "bookingUrl": "",
@@ -103,6 +106,8 @@
     "defaultAuthor": ""
   },
   "updates": {
-    "migrations": []
+    "migrations": [
+      "0001-contact-phone-address-hours"
+    ]
   }
 }

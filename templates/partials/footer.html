@@ -31,7 +31,10 @@
         {{# if nav.appearance.footer.showContact }}
         <p class="flex flex-col gap-1.5 group-data-[layout=centered]/footer:items-center">
           {{# if site.contact.email }}<a href="mailto:{{ site.contact.email }}" class="w-fit text-zinc-300 no-underline transition-colors hover:text-white group-data-[theme=brand]/footer:text-white group-data-[tone=light]/footer:text-zinc-700 group-data-[tone=light]/footer:hover:text-zinc-950">{{ site.contact.email }}</a>{{/ if }}
+          {{# if site.contact.phone }}<a href="tel:{{ site.contact.phone }}" class="w-fit text-zinc-300 no-underline transition-colors hover:text-white group-data-[theme=brand]/footer:text-white group-data-[tone=light]/footer:text-zinc-700 group-data-[tone=light]/footer:hover:text-zinc-950">{{ site.contact.phone }}</a>{{/ if }}
           {{# if site.contact.whatsappUrl }}<a href="{{ site.contact.whatsappUrl }}" class="w-fit text-zinc-300 no-underline transition-colors hover:text-white group-data-[theme=brand]/footer:text-white group-data-[tone=light]/footer:text-zinc-700 group-data-[tone=light]/footer:hover:text-zinc-950">{{ site.contact.whatsapp }}</a>{{/ if }}
+          {{# if site.contact.address }}<span>{{ site.contact.address }}</span>{{/ if }}
+          {{# if site.contact.hours }}<span>{{ site.contact.hours }}</span>{{/ if }}
         </p>
         {{/ if }}
         {{# if nav.appearance.footer.showSocial }}{{# if nav.social }}
