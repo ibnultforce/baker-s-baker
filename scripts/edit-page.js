@@ -55,6 +55,11 @@
  *   node scripts/edit-page.js --list                    show the queue, run nothing
  *
  * Options for a single edit:
+ *   --reference=<path>       a screenshot or mockup of the design the page should
+ *                            have (at most 2; PNG, JPEG, GIF or WebP, up to 5 MB):
+ *                            Claude replicates its layout, colours and type, and
+ *                            never puts the picture itself on the page. Any file
+ *                            inside the repo, .git included.
  *   --image=<path|url>       an image Claude should see and may place in the
  *                            page; repeat for several. A path is a file in this
  *                            repo (e.g. assets/img/uploads/team.jpg, shown on
@@ -94,6 +99,7 @@ import { ROOT, readJson, loadSite, unclosedRawText } from './lib/content.js';
 import { parseFrontmatter, renderMarkdown } from './lib/markdown.js';
 import { TemplateEngine } from './lib/template.js';
 import { renderCheck, scriptCheck } from './lib/render-check.js';
+import { screenshotProposal } from './lib/design-review.js';
 import { PAGE_MAX_TOKENS, bannedPhraseWarnings, requestClaude, resolveImages, stripFence } from './lib/claude-writer.js';
 import { knowledgePrompt, recordWork, summarizeChange } from './lib/knowledge.js';
 import { BLANK_LAYOUT_RULES, DESIGN_RULES, isDesigned, layoutShowsTitle, styleReference } from './lib/design-rules.js';
@@ -147,6 +153,9 @@ const positional = argv.filter((a) => !a.startsWith('--'));
 const dryRun = Boolean(flag('dry-run'));
 const generateFlag = Boolean(flag('generate'));
 const imageArgs = argv.filter((a) => a.startsWith('--image=')).map((a) => a.slice('--image='.length));
+// Screenshots of a design to replicate (--reference=<file>, repeatable, at most 2): shown to Claude
+// as the look to build, never placed on the page. The Twinstack web app keeps them inside .git.
+const referenceArgs = argv.filter((a) => a.startsWith('--reference=')).map((a) => a.slice('--reference='.length));
 const proposalOut = flag('proposal-out');
 const fromHtml = flag('from-html');
 // A conversion keeps the page's own HTML and CSS unless --markdown asks for it to be rewritten in
@@ -161,6 +170,10 @@ const noRenderCheck = Boolean(flag('no-render-check'));
 // copied as they are, on every page (buildChrome). Without these the site keeps its own.
 const withHeaderFlag = Boolean(flag('with-header'));
 const withFooterFlag = Boolean(flag('with-footer'));
+// The owner's choice for this page alone: --own-chrome keeps its header and footer on it, without the
+// site's, and --site-chrome always gives it the site's. Without either, ownChrome decides.
+const ownChromeFlag = Boolean(flag('own-chrome'));
+const siteChromeFlag = Boolean(flag('site-chrome'));
 
 const site = readJson(path.join(ROOT, 'site.config.json'));
 // The Twinstack web app passes the account's chosen model; run by hand, the site's own setting.
@@ -173,6 +186,18 @@ const FAST_MODEL = process.env.TWINSTACK_FAST_MODEL || '';
 // to CLAUDE_MODEL, `small` (wording, facts, removals, a one-property tweak) may go to FAST_MODEL
 // even without a design to follow. Unset or `standard`, pageModel's own rules decide.
 const TASK_SIZE = ['small', 'standard', 'complex'].includes(process.env.TWINSTACK_TASK_SIZE) ? process.env.TWINSTACK_TASK_SIZE : '';
+// How hard Claude thinks before writing a page or the header and footer (default `high`). The
+// Twinstack web app may pass a lower one to trade quality for speed.
+const EFFORT = ['low', 'medium', 'high'].includes(process.env.TWINSTACK_EFFORT) ? process.env.TWINSTACK_EFFORT : 'high';
+// How many times Claude looks at screenshots of the page it wrote and improves it (reviewDesign),
+// 0–3: TWINSTACK_DESIGN_REVIEW (the Twinstack web app sets it for a site's first homepage and new
+// pages) or --design-review=<n>. Needs Chrome or Chromium and Node 22+, else it's skipped.
+// The model that reviews (the Twinstack web app passes Sonnet: it reads screenshots well at half
+// Opus's price), else CLAUDE_MODEL, at medium effort: it fixes, it doesn't design from scratch.
+const REVIEW_MODEL = process.env.TWINSTACK_REVIEW_MODEL || CLAUDE_MODEL;
+const REVIEW_EFFORT = 'medium';
+const reviewFlag = flag('design-review');
+const REVIEW_ROUNDS = Math.max(0, Math.min(3, Number.parseInt(reviewFlag === true ? '2' : reviewFlag ?? process.env.TWINSTACK_DESIGN_REVIEW ?? '0', 10) || 0));
 const apiKey = process.env.ANTHROPIC_API_KEY;
 
 /* ------------------------------------------------------------------ queue */
@@ -838,7 +863,8 @@ function siteImage(src, base = null) {
   const value = src.startsWith('//') ? `https:${src}` : src;
   if (/^https?:\/\//i.test(value)) return value;
   const relative = path.posix.normalize(value.split(/[?#]/)[0].replace(/^\/+/, '').replace(/^\.\//, ''));
-  if (!relative.startsWith('../') && relative.split('/')[0] !== '.git' && fs.existsSync(path.join(ROOT, relative))) return `/${relative}`;
+  // A file in static/ is published at the site's root, so that's the same address.
+  if (!relative.startsWith('../') && relative.split('/')[0] !== '.git' && (fs.existsSync(path.join(ROOT, relative)) || fs.existsSync(path.join(ROOT, 'static', relative)))) return `/${relative}`;
   return absoluteUrl(value, base);
 }
 
@@ -875,7 +901,7 @@ function absoluteInlineStyles(markup, base) {
 }
 
 /** Whether a root-relative path is a file in this repo. */
-const inRepo = (ref) => ref.startsWith('/') && !ref.startsWith('//') && fs.existsSync(path.join(ROOT, ref.split(/[?#]/)[0].slice(1)));
+const inRepo = (ref) => ref.startsWith('/') && !ref.startsWith('//') && [ROOT, path.join(ROOT, 'static')].some((dir) => fs.existsSync(path.join(dir, ref.split(/[?#]/)[0].slice(1))));
 
 /**
  * Downloads a stylesheet the page links from another server (a CDN's icon
@@ -1023,7 +1049,10 @@ function standIns(uploads, globals, remote = new Map()) {
  */
 async function buildStyledPage(source, cssFiles, relFile, jsFiles = [], chromeWanted = { header: false, footer: false }) {
   const { file, html } = readHtmlSource(source);
-  const page = cleanHtml(html, { keepStyles: true, prefix: IMPORT_PREFIX });
+  let page = cleanHtml(html, { keepStyles: true, prefix: IMPORT_PREFIX });
+  // A page whose own header or footer isn't the one the site copied keeps its own (see ownChrome).
+  const own = chromeWanted.header || chromeWanted.footer || siteChromeFlag ? null : ownChromeFlag ? 'choice' : ownChrome(page);
+  if (own) page = cleanHtml(html, { keepStyles: true, prefix: IMPORT_PREFIX, keepChrome: true });
   if (!page.text && !/<(img|svg)\b/i.test(page.html)) throw new Error(`${file} has no content left once its header and footer are removed`);
   // Where the page was published: its relative images, scripts and stylesheets are still there.
   const base = pageBaseUrl(html);
@@ -1089,12 +1118,19 @@ async function buildStyledPage(source, cssFiles, relFile, jsFiles = [], chromeWa
   }
   const allSheets = [...unmatched, ...sheets];
   const reveal = detectReveal(allSheets, page.classes);
+  // Classes scripts switch on later. One the old <html> or <body> also had must still match the
+  // element inside it's put on, not only the wrapper.
+  const switchedClasses = scriptClasses(scripts.sources.map((s) => s.code));
+  const contentClasses = new Set([...page.classes, ...[...switchedClasses].filter((c) => page.rootClasses.has(c))]);
   const scoped = scopeCss(allSheets, {
-    scope: `.${IMPORT_SCOPE}`, prefix: IMPORT_PREFIX, classes: page.classes, ids: page.ids,
+    scope: `.${IMPORT_SCOPE}`, prefix: IMPORT_PREFIX, classes: contentClasses, ids: page.ids,
     rootClasses: page.rootClasses, rootIds: page.rootIds, reveal,
     hints: presentationalHints(body, `.${IMPORT_SCOPE}`, bodyAttributes(html)),
-    // Scripts may add classes later, so rules for classes not in the markup stay (bar the removed parts').
-    scripted: scripts.entries.length > 0, dropClasses: page.removedClasses, dropIds: page.removedIds,
+    // Scripts may add classes later, so rules for classes not in the markup stay (bar the removed
+    // parts', unless a script switches the class on: then the removed header used it too).
+    scripted: scripts.entries.length > 0,
+    dropClasses: [...page.removedClasses].filter((c) => !switchedClasses.has(c)),
+    dropIds: page.removedIds,
   });
   // Icons drawn from a sprite outside the kept content (<use href="#i-arrow">) need it with them.
   const sprite = svgDefinitions(html, body, IMPORT_PREFIX);
@@ -1104,6 +1140,8 @@ async function buildStyledPage(source, cssFiles, relFile, jsFiles = [], chromeWa
   if (!scoped.rules) warnings.push("no CSS rules apply to this page's content, so it will show with browser default styles");
   if (scoped.css.length > MAX_IMPORTED_CSS) throw new Error(`the page's CSS is over ${MAX_IMPORTED_CSS / 1024} KB even after unused rules are removed`);
   if (page.removed.length) warnings.push(`removed from the HTML: ${page.removed.join(', ')}`);
+  if (own === 'choice') warnings.push("kept the page's own header and footer, as asked, without the site's");
+  else if (own) warnings.push(`kept the page as it was, without the site's header and footer: its ${own} doesn't match the ones the site copied from ${ownChromeSource() ?? 'another page'}`);
 
   // The page's own header and footer, copied as the site's (--with-header / --with-footer).
   const chrome = chromeWanted.header || chromeWanted.footer
@@ -1114,7 +1152,10 @@ async function buildStyledPage(source, cssFiles, relFile, jsFiles = [], chromeWa
   // The old <html>/<body> classes now belong to the wrapper, so their rules still apply.
   const wrapperClass = [IMPORT_SCOPE, ...[...page.rootClasses].map((c) => IMPORT_PREFIX + c)].join(' ');
   // The page the copied header and footer came from runs their scripts itself (see buildChrome).
-  const chromeSource = chrome?.id ? ` data-chrome-source="${chrome.id}"` : '';
+  // So does a page that had the same header: its own scripts open the same menu, and running the
+  // copied ones too would bind every button twice (a tap would open the menu and close it again).
+  const sharedId = own || chrome?.id ? null : sharedChromeDrivenBy(scripts);
+  const chromeSource = chrome?.id || sharedId ? ` data-chrome-source="${chrome?.id || sharedId}"` : '';
   return {
     file,
     html,
@@ -1132,6 +1173,8 @@ async function buildStyledPage(source, cssFiles, relFile, jsFiles = [], chromeWa
     body: `<div class="${wrapperClass}"${chromeSource}${revealAttributes(reveal, html)}>\n${asRawBlock(body)}\n</div>\n`,
     // The copied header and footer: { id, files, header, footer, css } or null.
     chrome,
+    // The page keeps its own header and footer (frontmatter ownChrome, which base.html reads).
+    ownChrome: Boolean(own),
     reveal,
     fonts: [...new Set(fonts)],
     stylesheet: { file: importedStylesheet(relFile), content: `/* Imported with ${path.posix.basename(file)} by scripts/edit-page.js --keep-styles. Scoped to .${IMPORT_SCOPE}; regenerate it by converting again. */\n${scoped.css}` },
@@ -1163,6 +1206,103 @@ function pageUrlOf(relFile) {
 }
 // Scripts a copied header never needs on every page: analytics and ad tags.
 const ANALYTICS_SCRIPT = /googletagmanager|google-analytics|gtag\/js|connect\.facebook|hotjar|clarity\.ms|segment\.(com|io)|plausible|matomo|doubleclick/i;
+
+/** What a visitor reads in a piece of HTML: no tags, scripts, styles, drawings or template tags. */
+function readableText(html) {
+  const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+  return visibleText(
+    html
+      .replace(/<(script|style|svg|template|noscript)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+      .replace(/\{\{[\s\S]*?\}\}/g, ' '),
+  )
+    // The copy may write a character as an entity where the original didn't, or the other way round.
+    .replace(/&(?:#(\d+)|#x([0-9a-f]+)|([a-z]+));/gi, (whole, dec, hex, name) =>
+      dec ? String.fromCodePoint(Number(dec)) : hex ? String.fromCodePoint(parseInt(hex, 16)) : (named[name.toLowerCase()] ?? whole))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** A fingerprint of a header's or footer's markup (cleanHtml's chrome part), its scripts and styles and spacing aside. */
+function chromeKey(html) {
+  const markup = html.replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '').replace(/\s+/g, ' ').trim();
+  return createHash('sha1').update(markup).digest('hex').slice(0, 16);
+}
+
+/** The site's header and footer partials when they were copied from a page (--with-header), else null. */
+function copiedChrome() {
+  const read = (rel) => (fs.existsSync(path.join(ROOT, rel)) ? fs.readFileSync(path.join(ROOT, rel), 'utf8') : '');
+  const header = read(HEADER_FILE);
+  const footer = read(FOOTER_FILE);
+  if (!header.includes(COPIED_MARK) && !footer.includes(COPIED_MARK)) return null;
+  return { header: header.includes(COPIED_MARK) ? header : null, footer: footer.includes(COPIED_MARK) ? footer : null };
+}
+
+/** The page the site's copied header and footer came from (data-chrome-from), or null. */
+function ownChromeSource() {
+  const copied = copiedChrome();
+  return /\bdata-chrome-from="([^"]*)"/.exec(copied?.header ?? copied?.footer ?? '')?.[1] ?? null;
+}
+
+/**
+ * The copied header's id (data-chrome-id) when this page's own kept scripts drive its elements (they
+ * name one of its ids), else null: the page then runs them itself, as the page it was copied from does.
+ */
+function sharedChromeDrivenBy(scripts) {
+  const copied = copiedChrome();
+  if (!copied) return null;
+  const markup = `${copied.header ?? ''}\n${copied.footer ?? ''}`;
+  const chromeId = /\bdata-chrome-id="([^"]+)"/.exec(markup)?.[1];
+  if (!chromeId) return null;
+  const visible = markup.replace(/<template\b[\s\S]*?<\/template\s*>/gi, '');
+  const ids = [...visible.matchAll(/\bid\s*=\s*["']([^"']+)["']/gi)].map((m) => m[1]).filter((id) => id.length >= 3);
+  const code = scripts.sources.map((s) => s.code ?? '').join('\n');
+  return ids.some((id) => new RegExp(`["'#]${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'\\s.:\\[)]`).test(code)) ? chromeId : null;
+}
+
+/**
+ * When the site's header and footer were copied from one page, a page whose own header or footer
+ * reads differently (a product's own menu and "Install" button) keeps its own: showing the site's
+ * there would change how it looks. Compared by the text a visitor reads, so a highlighted menu item
+ * or a different id doesn't count. Returns "header", "footer", "header and footer" or null.
+ */
+function ownChrome(page) {
+  const copied = copiedChrome();
+  if (!copied) return null;
+  const differs = (place) => {
+    const mine = readableText(page.chrome[place].html);
+    if (!mine || copied[place] === null) return false;
+    // The markup the site's copy was made from: any difference (another menu, its styling, which
+    // item is marked current) shows, so only the very same header is the site's.
+    const key = /\bdata-chrome-key="([^"]+)"/.exec(copied[place])?.[1];
+    return key ? chromeKey(page.chrome[place].html) !== key : mine !== readableText(copied[place]);
+  };
+  const parts = ['header', 'footer'].filter(differs);
+  // A page with neither (a bare "not found" page, a landing page) showed none.
+  if (!parts.length && !readableText(page.chrome.header.html) && !readableText(page.chrome.footer.html)) return 'lack of a header and footer';
+  return parts.length ? parts.join(' and ') : null;
+}
+
+/**
+ * Class names scripts may add or remove later: the string arguments of classList.add/remove/
+ * toggle/replace and the strings assigned to className or set as "class". Their CSS rules must
+ * stay even when a removed part (or, for the header and footer, the page) also uses the class:
+ * a bar that goes full width on scroll adds `w-full`, which the page's content has too.
+ */
+function scriptClasses(codes) {
+  const found = new Set();
+  // A class name never holds a quote or a line break, so the shortest quoted run is enough.
+  const strings = (text) => [...text.matchAll(/"([^"\r\n]*)"|'([^'\r\n]*)'|`([^`]*)`/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+  for (const code of codes) {
+    if (!code) continue;
+    const calls = [
+      ...code.matchAll(/\.classList\s*\.\s*(?:add|remove|toggle|replace)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g),
+      ...code.matchAll(/\.className\s*\+?=\s*([^;\n]+)/g),
+      ...code.matchAll(/setAttribute\s*\(\s*["']class["']\s*,([^)]*)\)/g),
+    ];
+    for (const [, args] of calls) for (const s of strings(args)) for (const name of s.split(/\s+/)) if (/^-?[_a-zA-Z][\w\-:[\]%./#()!,]*$/.test(name)) found.add(name);
+  }
+  return found;
+}
 
 /**
  * The page's own header and footer, copied as the site's: the HTML cleanHtml
@@ -1237,10 +1377,16 @@ function buildChrome({ html, file, page, sheets, scripts, base, fonts, wanted, p
   });
 
   const pageOnly = (all, kept) => [...all].filter((x) => !kept.has(x));
+  // Classes the kept scripts switch on later (the bar's scrolled state) keep their rules, even
+  // when the page's content uses them too.
+  const switched = scriptClasses(files.map((f) => f.content));
+  // One the old <html> or <body> also had (<html class="w-full">) must still match the element
+  // the script puts it on, not only the wrapper.
+  const inside = new Set([...classes, ...[...switched].filter((c) => page.rootClasses.has(c))]);
   const scoped = scopeCss(sheets, {
-    scope: `.${CHROME_SCOPE}`, prefix: IMPORT_PREFIX, classes, ids, rootClasses: page.rootClasses, rootIds: page.rootIds,
+    scope: `.${CHROME_SCOPE}`, prefix: IMPORT_PREFIX, classes: inside, ids, rootClasses: page.rootClasses, rootIds: page.rootIds,
     hints: presentationalHints(Object.values(markup).join('\n'), `.${CHROME_SCOPE}`),
-    scripted: tags.length > 0, dropClasses: pageOnly(page.classes, classes), dropIds: pageOnly(page.ids, ids), chrome: true,
+    scripted: tags.length > 0, dropClasses: pageOnly(page.classes, new Set([...classes, ...switched])), dropIds: pageOnly(page.ids, ids), chrome: true,
   });
   if (scoped.css.length > MAX_IMPORTED_CSS) throw new Error(`the header and footer's CSS is over ${MAX_IMPORTED_CSS / 1024} KB even after unused rules are removed`);
   for (const place of Object.keys(markup)) markup[place] = scaleInlineRem(markup[place], scoped.remFactor);
@@ -1267,7 +1413,7 @@ function buildChrome({ html, file, page, sheets, scripts, base, fonts, wanted, p
   const helper = `(function(){var me=document.currentScript,home=me.previousElementSibling,w=home.previousElementSibling,spacer=null;if(w&&w.hasAttribute('data-chrome-spacer')){spacer=w;w=w.previousElementSibling;}var source=function(){return document.querySelector('.imported-page[data-chrome-source="${id}"]');};function size(){if(!spacer||window.scrollY>40)return;var b=0;Array.prototype.forEach.call(w.querySelectorAll('*'),function(e){var p=getComputedStyle(e).position;if(p!=='fixed'&&!(p==='absolute'&&(e.offsetParent===document.body||e.offsetParent===null)))return;var r=e.getBoundingClientRect();if(!r.height||r.left>=innerWidth||r.right<=0||r.top>120)return;if(r.bottom>b)b=r.bottom;});spacer.style.height=Math.ceil(b)+'px';}size();addEventListener('load',size);addEventListener('resize',size);document.addEventListener('DOMContentLoaded',function(){if(source())return;Array.prototype.forEach.call(w.querySelectorAll('a[href^="#"]'),function(a){var id=a.getAttribute('href').slice(1);if(id&&!document.querySelector('[id="'+id.replace(/["\\\\]/g,'\\\\$&')+'"]'))a.setAttribute('href',home.getAttribute('href')+'#'+id);});});})();`;
   const partial = (place, withLinks, withScripts) => [
     `<!-- Copied from ${from.replace(/--/g, '-')} by scripts/edit-page.js --with-${place}: fixed HTML, so the menu settings don't change it. Convert again, or restore the standard ${place}, to change it. -->`,
-    `<div class="${wrapperClass}" ${COPIED_MARK} data-chrome-id="${id}" data-chrome-from="${attr(from)}">`,
+    `<div class="${wrapperClass}" ${COPIED_MARK} data-chrome-id="${id}" data-chrome-from="${attr(from)}" data-chrome-key="${chromeKey(parts[place].html)}">`,
     ...(withLinks ? [links] : []),
     asRawBlock(markup[place]),
     '</div>',
@@ -1392,6 +1538,8 @@ function assembleStyledFile(reply, styled) {
   if (styled.fonts.length) lines.push('fonts:', ...styled.fonts.map((url) => `  - "${url.replace(/"/g, '%22')}"`));
   // The imported page brings its own call to action; the site's would be added after it.
   if (!lines.some((line) => /^hideCta\s*:/.test(line))) lines.push('hideCta: true');
+  // Its own header and footer are in the body, so base.html leaves the site's out.
+  if (styled.ownChrome) lines.push('ownChrome: true');
   // Its scripts, in order, which base.html loads with assets/js/imported-page.js before them.
   if (styled.scripts.length) {
     lines.push('scripts:');
@@ -1427,7 +1575,8 @@ async function testStyledPage(styled, raw) {
     problems.push("the site's markdown renderer changes the copied HTML, so the page wouldn't show as the original");
   }
   const decode = (s) => visibleText(s.replace(/&#123;/g, '{').replace(/&#125;/g, '}').replace(/^&#32;$/gm, ''));
-  const originalText = decode(cleanHtml(styled.html, { keepStyles: true, prefix: '' }).html);
+  // The same parts left out as in the copy: none of its own header and footer when it kept them.
+  const originalText = decode(cleanHtml(styled.html, { keepStyles: true, prefix: '', keepChrome: styled.ownChrome }).html);
   const copiedText = decode(rendered);
   if (originalText !== copiedText) problems.push("the copy's text differs from the original's");
   checks.push(problems.length ? 'pass 1, content: failed' : `pass 1, content: the site's renderer keeps the page as it is, with all ${originalText.length} characters of its text`);
@@ -1518,7 +1667,7 @@ function originalTestDocument(styled) {
   head = head.replace(/<head\b[^>]*>/i, (open) => `${open}${/name\s*=\s*["']?viewport/i.test(head) ? '' : '<meta name="viewport" content="width=device-width, initial-scale=1">'}${unmatched}`);
   const htmlTag = /<html\b[^>]*>/i.exec(source)?.[0] ?? '<html>';
   const bodyTag = /<body\b[^>]*>/i.exec(source)?.[0] ?? '<body>';
-  const cleaned = cleanHtml(styled.html, { keepStyles: true, prefix: '' });
+  const cleaned = cleanHtml(styled.html, { keepStyles: true, prefix: '', keepChrome: styled.ownChrome });
   // A copied header and footer are compared too: in the original they're around the content.
   const kept = [styled.chrome?.header && cleaned.chrome.header.html, cleaned.html, styled.chrome?.footer && cleaned.chrome.footer.html].filter(Boolean).join('\n');
   const content = rewriteImages(`${kept}\n${svgDefinitions(styled.html, kept)}`, (src) => siteImage(src, styled.base));
@@ -1670,15 +1819,67 @@ function limitVision(images) {
   });
 }
 
-/** Text-only prompts stay a string; with images, each one is labelled and sent as vision input. */
+/**
+ * The --reference screenshots as vision input: inside the repo (.git included, where the web app
+ * keeps them), a PNG, JPEG, GIF or WebP by its first bytes, at most 2 of up to 5 MB each.
+ */
+function loadReferences(list) {
+  const out = [];
+  for (const entry of list.slice(0, 2)) {
+    const absolute = path.resolve(ROOT, entry);
+    if (!absolute.startsWith(ROOT + path.sep)) {
+      console.log(`  ! design reference "${entry}" — outside the site's files, skipped`);
+      continue;
+    }
+    if (!fs.existsSync(absolute)) {
+      console.log(`  ! design reference "${entry}" — file not found, skipped`);
+      continue;
+    }
+    const bytes = fs.readFileSync(absolute);
+    const type =
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+        ? 'image/png'
+        : bytes[0] === 0xff && bytes[1] === 0xd8
+          ? 'image/jpeg'
+          : bytes.subarray(0, 3).toString('latin1') === 'GIF'
+            ? 'image/gif'
+            : bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP'
+              ? 'image/webp'
+              : null;
+    if (!type || bytes.length > 5 * 1024 * 1024) {
+      console.log(`  ! design reference "${entry}" — ${type ? 'over 5 MB' : "not a PNG, JPEG, GIF or WebP"}, skipped`);
+      continue;
+    }
+    out.push({ ref: entry, block: { type: 'image', source: { type: 'base64', media_type: type, data: bytes.toString('base64') } } });
+  }
+  return out;
+}
+
+const REFERENCES = loadReferences(referenceArgs);
+
+// What a design reference asks for. It overrides the site's own look and the design rules' freedom
+// to choose one; the responsive and accessibility rules still hold.
+const REFERENCE_NOTE = `
+
+DESIGN REFERENCE: the images labelled "Design reference" are screenshots of the design the owner wants for this page, and they asked for it to be followed exactly. Replicate it as closely as you can:
+- the same sections in the same order, with the same layout, proportions and alignment;
+- the same colours (sample them from the screenshot: backgrounds, text, accents, buttons, borders);
+- the closest Google Font to each typeface, with the same sizes, weights, italics and letter spacing;
+- the same buttons, cards, icons, dividers, shadows, corner radii, spacing and decorative details.
+This overrides matching the site's other pages and any choice of your own about the look. Use the page's own words and facts where the screenshot shows text that isn't the owner's; where it shows a section the page has no content for, keep the section with clearly marked [sample] content. Where it shows photos, use the images you're given, or a placeholder block of the same size and shape. Never put the screenshot itself on the page. It must still work on phones: stack the same sections in the same order.`;
+
+/** Text-only prompts stay a string; with images or a design reference, each is labelled and sent as vision input. */
 function userContent(userPrompt, images) {
   const shown = images.filter((image) => image.block);
-  if (!shown.length) return userPrompt;
+  if (!shown.length && !REFERENCES.length) return userPrompt;
   const blocks = [];
+  REFERENCES.forEach((reference, i) => {
+    blocks.push({ type: 'text', text: `Design reference ${i + 1}: a screenshot of the design to replicate. It is not an image for the page.` }, reference.block);
+  });
   images.forEach((image, i) => {
     if (image.block) blocks.push({ type: 'text', text: `Image ${i + 1}: ${image.ref}` }, image.block);
   });
-  return [...blocks, { type: 'text', text: userPrompt }];
+  return [...blocks, { type: 'text', text: REFERENCES.length ? `${userPrompt}${REFERENCE_NOTE}` : userPrompt }];
 }
 
 /**
@@ -1724,6 +1925,8 @@ const SEARCH_FIELD_LABELS = { metaTitle: 'search title', metaDescription: 'searc
  */
 function pageModel(relFile, mode, images, original) {
   if (!FAST_MODEL || FAST_MODEL === CLAUDE_MODEL) return CLAUDE_MODEL;
+  // Copying a design from a screenshot is the most demanding page work there is.
+  if (REFERENCES.length) return CLAUDE_MODEL;
   if (!relFile.startsWith('content/') || !relFile.endsWith('.md')) return CLAUDE_MODEL;
   if (images.some((image) => image.block && image.block.source.type !== 'base64')) return CLAUDE_MODEL;
   // A conversion follows the HTML page it's given: its content and structure are all there.
@@ -1749,7 +1952,7 @@ async function askClaude(buildPrompts, images, { cache = false, model = CLAUDE_M
   // The prompts describe which images are shown, so they're rebuilt for the retry.
   const call = (list) => {
     const { systemPrompt, userPrompt } = buildPrompts(list);
-    return requestClaude({ apiKey, model, systemPrompt, userContent: userContent(userPrompt, list), maxTokens: MAX_TOKENS, effort: 'high', cache });
+    return requestClaude({ apiKey, model, systemPrompt, userContent: userContent(userPrompt, list), maxTokens: MAX_TOKENS, effort: EFFORT, cache });
   };
   try {
     return { ...(await call(images)), images };
@@ -1763,6 +1966,146 @@ async function askClaude(buildPrompts, images, { cache = false, model = CLAUDE_M
     );
     return { ...(await call(fallback)), images: fallback };
   }
+}
+
+/* ---------------------------------------------------------- design review */
+
+const REVIEW_ASK = `Above are screenshots of the page you just wrote, built into the site and opened in a browser: one screen at a time, top to bottom, at each width. The site's header and footer around it are designed separately, so judge only the page between them, and never add a header, menu or footer to it.
+
+Look at it the way a demanding senior designer would before showing it to the client, and be honest: the first version is rarely the best one. Check:
+- The first screen: does it make a strong, specific impression for this business and say at once what it does and what to do next?
+- Hierarchy and type: a confident heading scale, readable text, nothing too small, too faint or too crowded.
+- Spacing and alignment: even rhythm between sections, consistent gutters, nothing cramped or floating in empty space.
+- Variety: does each section have its own layout, or does the page repeat itself or look like a generic template?
+- Colour, depth and contrast: does it feel finished and polished, with enough contrast everywhere?
+- Images: well sized and cropped, placed where they help.
+- Anything broken: overlapping or cut-off text, horizontal scrolling, invisible text, awkward wrapping, squashed columns or misaligned grids, especially on the phone.
+- Length: visitors on a phone stop scrolling. If the page is more than about 8 phone screens long, tighten vertical spacing and trim repetition to bring it nearer that, without dropping anything the request asked for.
+- Facts: sample people (names, photos of staff), opening hours, prices, addresses or phone numbers the request didn't give must not be on the page; take them out.
+
+Then fix what's weak. Keep the page's content, facts, links and images, and everything the request asked for; don't add images you weren't given.
+
+Don't write the page again: reply with targeted fixes to the file you wrote, in exactly this format:
+===== REVIEW =====
+- up to 6 short points, each one thing you fixed and why
+===== FIXES =====
+<<<<<<< FIND
+an exact, unique piece of the file as it is now (a few whole lines, copied character for character)
+=======
+what replaces it
+>>>>>>> REPLACE
+
+Repeat the FIND/REPLACE block for each fix (up to 15). Each FIND must match the file exactly once; keep the blocks small, but a whole section may be replaced when it needs a new layout.
+
+If the page is already excellent and you'd change nothing, reply with only the words NO CHANGES.`;
+
+const REVIEW_REPLY = /=====\s*REVIEW\s*=====\s*([\s\S]*?)=====\s*FIXES\s*=====\s*([\s\S]*)$/;
+const FIX_BLOCK = /<<<<<<< FIND\r?\n([\s\S]*?)\r?\n=======\r?\n([\s\S]*?)>>>>>>> REPLACE/g;
+const MAX_FIXES = 15;
+
+/**
+ * `text` with the review's FIND/REPLACE fixes applied in order. A fix whose FIND isn't in the text
+ * exactly once is skipped. Resolves to { text, applied, skipped }.
+ */
+function applyFixes(text, fixesText) {
+  let out = text;
+  let applied = 0;
+  let skipped = 0;
+  for (const [, find, replacement] of [...fixesText.matchAll(FIX_BLOCK)].slice(0, MAX_FIXES)) {
+    const at = find ? out.indexOf(find) : -1;
+    if (at < 0 || out.indexOf(find, at + 1) >= 0) {
+      skipped++;
+      continue;
+    }
+    out = out.slice(0, at) + replacement.replace(/\r?\n$/, '') + out.slice(at + find.length);
+    applied++;
+  }
+  return { text: out, applied, skipped };
+}
+const SHOWN_EARLIER = 'Screenshots of an earlier version, no longer shown.';
+
+/** The screenshots as content blocks, each width under a line saying what it is. */
+function screenshotBlocks(screens) {
+  const blocks = [];
+  for (const screen of screens) {
+    blocks.push({ type: 'text', text: `${screen.shots.length} screen${screen.shots.length === 1 ? '' : 's'} on ${screen.label}, top to bottom (the page is ${screen.pageHeight} px tall there, about ${Math.max(1, Math.round(screen.pageHeight / screen.height))} screens):` });
+    for (const shot of screen.shots) blocks.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: shot.data } });
+  }
+  return [...blocks, { type: 'text', text: REVIEW_ASK }];
+}
+
+/**
+ * Claude looks at the page it wrote and improves it, up to REVIEW_ROUNDS times: the site is built
+ * with the page in place, photographed at a computer's and a phone's width (lib/design-review.js),
+ * and the screenshots go back to REVIEW_MODEL in the same conversation as the first request. It
+ * answers with targeted FIND/REPLACE fixes (far fewer tokens than the whole page again). The fixed
+ * page must pass the same checks as the first reply, or it's left out and the last good version
+ * stays. Never fails the change: anything that goes wrong ends the review with a warning.
+ * Resolves to { raw, checks, warnings } (`warnings` null when the first version was kept).
+ */
+async function reviewDesign({ relFile, mode, original, raw, reply, buildPrompts, isContent }) {
+  const checks = [];
+  const notes = [];
+  let warnings = null;
+  let current = raw;
+  const { systemPrompt, userPrompt } = buildPrompts(reply.images);
+  const messages = [{ role: 'user', content: userContent(userPrompt, reply.images) }, { role: 'assistant', content: reply.text }];
+  for (let round = 1; round <= REVIEW_ROUNDS; round++) {
+    console.log(`  Looking at the page in a browser (review ${round} of ${REVIEW_ROUNDS})…`);
+    const shots = await screenshotProposal({ file: relFile, content: current, files: [] });
+    if (!shots.ran) {
+      console.log(`  ! Couldn't look at the page: ${shots.reason}`);
+      notes.push(`the page couldn't be looked at in a browser (${shots.reason})`);
+      break;
+    }
+    // Only the latest screenshots are shown: earlier ones become a line of text.
+    for (const message of messages) {
+      if (message.role === 'user' && Array.isArray(message.content) && message.content.some((b) => b.text === REVIEW_ASK)) message.content = SHOWN_EARLIER;
+    }
+    messages.push({ role: 'user', content: screenshotBlocks(shots.screens) });
+    let answer;
+    try {
+      answer = await requestClaude({ apiKey, model: REVIEW_MODEL, systemPrompt, messages, maxTokens: MAX_TOKENS, effort: REVIEW_EFFORT, cache: REVIEW_ROUNDS > 1 });
+    } catch (error) {
+      console.log(`  ! The review failed: ${error.message.slice(0, 200)}`);
+      notes.push(`the design review stopped early (${error.status === 402 ? 'no Claude credits left' : error.message.slice(0, 120)})`);
+      break;
+    }
+    if (answer.stopReason === 'refusal' || answer.stopReason === 'max_tokens') {
+      notes.push(`the design review's version was left out (${answer.stopReason === 'refusal' ? 'declined' : 'cut off'})`);
+      break;
+    }
+    if (/^\s*NO CHANGES\s*\.?\s*$/i.test(answer.text)) {
+      console.log('  Claude looked at the page and changed nothing.');
+      checks.push(`Looked at in a browser on a computer and a phone${round > 1 ? ' again' : ''}: nothing more to improve`);
+      break;
+    }
+    const parts = answer.text.match(REVIEW_REPLY);
+    if (!parts) {
+      notes.push("the design review's reply wasn't in the expected form, so the previous version was kept");
+      break;
+    }
+    const fixed = applyFixes(current, parts[2]);
+    if (!fixed.applied) {
+      notes.push(`none of the design review's fixes matched the page${fixed.skipped ? ` (${fixed.skipped} skipped)` : ''}, so it was kept as it was`);
+      break;
+    }
+    if (fixed.skipped) console.log(`  ! review ${round}: ${fixed.skipped} fix${fixed.skipped === 1 ? '' : 'es'} didn't match the page and were skipped`);
+    const candidate = fixed.text;
+    const checked = mode === 'generate' ? generateChecks(original, candidate, reply.images, relFile) : editChecks(original, candidate, isContent);
+    if (checked.problems.length) {
+      for (const problem of checked.problems) console.log(`  ! review ${round}: ${problem}`);
+      notes.push(`the design review's version ${round} didn't pass the checks, so the previous version was kept`);
+      break;
+    }
+    const changes = parts[1].split('\n').map((line) => line.replace(/^\s*[-*]\s*/, '').trim()).filter(Boolean).slice(0, 6);
+    for (const change of changes) console.log(`  · ${change}`);
+    checks.push(`Looked at in a browser on a computer and a phone by ${REVIEW_MODEL} (review ${round}) and improved: ${changes.join('; ') || 'the design'}`);
+    current = candidate;
+    warnings = checked.warnings;
+    messages.push({ role: 'assistant', content: answer.text });
+  }
+  return { raw: current, checks, warnings: warnings && [...warnings, ...notes], notes };
 }
 
 /* ----------------------------------------------------------------- checks */
@@ -2263,6 +2606,7 @@ async function applyEdit(relFile, instruction, imageEntries = [], mode = 'edit',
   for (const [i, image] of images.entries()) {
     console.log(`  Image ${i + 1}: ${image.ref}${image.block ? '' : ` (reference only: ${image.why || 'not readable'})`}`);
   }
+  for (const [i, reference] of REFERENCES.entries()) console.log(`  Design reference ${i + 1}: ${reference.ref} (the design to replicate)`);
 
   const layout = generate || convert ? layoutFor(relFile, parseFrontmatter(base).data) : null;
   // A page that shows shared data (the homepage's sections) is edited together with that data.
@@ -2285,10 +2629,14 @@ async function applyEdit(relFile, instruction, imageEntries = [], mode = 'edit',
     return false;
   }
 
+  // A page Claude designs on its own (not one built from shared data or brought in from HTML) can
+  // be looked at in a browser and improved afterwards (reviewDesign).
+  const reviewing = REVIEW_ROUNDS > 0 && !multi && !convert && relFile.startsWith('content/') && relFile.endsWith('.md');
+
   // One request and the checks on its reply.
   const attempt = async (useModel) => {
-    // A conversion is always reviewed, and the review resends this whole request.
-    const reply = await askClaude(buildPrompts, images, { cache: Boolean(convert), model: useModel });
+    // A conversion is always reviewed, and so is a design review's page: each resends this request.
+    const reply = await askClaude(buildPrompts, images, { cache: Boolean(convert) || (reviewing && useModel === REVIEW_MODEL), model: useModel });
     if (reply.stopReason === 'refusal') return { reply };
     // Content files are taken from their frontmatter on; a template or other file is the whole reply.
     let raw = generate || convert ? fileFromReply(reply.text) : stripFence(reply.text);
@@ -2354,6 +2702,13 @@ async function applyEdit(relFile, instruction, imageEntries = [], mode = 'edit',
   let { raw, warnings, checks } = result;
   if (fellBack) checks = [...checks, fellBack];
   else if (model !== CLAUDE_MODEL) checks = [...checks, `Written by ${model}, following the site's existing design, and passed the checks`];
+
+  if (reviewing && !problems.length) {
+    const review = await reviewDesign({ relFile, mode, original, raw, reply, buildPrompts, isContent });
+    raw = review.raw;
+    checks = [...checks, ...review.checks];
+    warnings = review.warnings ?? [...warnings, ...review.notes];
+  }
 
   // A page's first real content (its skeleton or draft written, an HTML page brought in) makes it
   // a new page, which gets its search text. Later edits leave the search text to the owner.
@@ -2471,7 +2826,7 @@ async function applyChrome(instruction) {
 
   // One request and the checks on its reply.
   const attempt = async (useModel) => {
-    const reply = await requestClaude({ apiKey, model: useModel, systemPrompt, userContent: userPrompt, maxTokens: MAX_TOKENS, effort: 'high' });
+    const reply = await requestClaude({ apiKey, model: useModel, systemPrompt, userContent: userPrompt, maxTokens: MAX_TOKENS, effort: EFFORT });
     if (reply.stopReason === 'refusal') return { reply, files: {}, problems: [], warnings: [] };
     const files = readChromeReply(reply.text);
     const { problems, warnings } = chromeChecks(files, { partialNames: partialNames() });
@@ -2695,8 +3050,9 @@ if (flag('chrome')) {
   const usable =
     (mode === 'edit' ? Boolean(instruction) : mode === 'generate' ? fromHtml === undefined : typeof fromHtml === 'string') &&
     ((!markdownFlag && !flag('keep-styles') && !cssArgs.length) || mode === 'convert') &&
-    !(markdownFlag && (cssArgs.length || jsArgs.length || withHeaderFlag || withFooterFlag)) &&
-    (mode === 'convert' || (!jsArgs.length && !withHeaderFlag && !withFooterFlag));
+    !(markdownFlag && (cssArgs.length || jsArgs.length || withHeaderFlag || withFooterFlag || ownChromeFlag || siteChromeFlag)) &&
+    !(ownChromeFlag && (siteChromeFlag || withHeaderFlag || withFooterFlag)) &&
+    (mode === 'convert' || (!jsArgs.length && !withHeaderFlag && !withFooterFlag && !ownChromeFlag && !siteChromeFlag));
   if (!usable) {
     console.error(`
   Usage:
@@ -2705,6 +3061,7 @@ if (flag('chrome')) {
     node scripts/edit-page.js <page> --from-html=<file.html> [--css=<file.css>...] ["<direction>"]
                                                               copy an existing HTML page in, as it is, with its own CSS
       add --with-header and/or --with-footer to make the page's own header and footer the site's, copied as they are
+      add --own-chrome to keep them on this page only, or --site-chrome to give it the site's
     node scripts/edit-page.js <page> --from-html=<file.html> --markdown ["<direction>"]
                                                               rewrite it as markdown in the site's design instead
     node scripts/edit-page.js --chrome ["<direction>"]        design the header and footer (shown on every page)
